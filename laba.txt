@@ -1,0 +1,447 @@
+import requests
+import telebot
+from telebot.types import ReplyKeyboardMarkup
+from datetime import datetime, timedelta
+import csv
+import os
+import signal
+import sys
+from collections import defaultdict
+from functools import wraps
+from secr import TOKEN
+
+bot_running = True
+
+# Словарь для отслеживания сообщений пользователей
+user_message_count = defaultdict(int)
+user_block_time = {}
+MESSAGE_LIMIT = 30  # Максимум 10 сообщений
+TIME_WINDOW = 60    # за 60 секунд
+BLOCK_TIME = 300    # Блокировка на 300 секунд (5 минут)
+
+def signal_handler(sig, frame):
+    """Обработчик сигналов для graceful shutdown"""
+    global bot_running
+    print("\n🛑 Получен сигнал остановки...")
+    bot_running = False
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+if not os.path.exists('logs'):
+    os.makedirs('logs')
+
+CSV_FILE = 'logs/bot_log.csv'
+if not os.path.exists(CSV_FILE):
+    with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Unic ID', '@TG nick', 'Motion', 'API', 'Date', 'Time', 'API answer'])
+
+def check_user_block(user_id):
+    """Проверяет, заблокирован ли пользователь"""
+    if user_id in user_block_time:
+        block_until = user_block_time[user_id]
+        if datetime.now() < block_until:
+            remaining = (block_until - datetime.now()).seconds
+            return True, remaining
+        else:
+            # Разблокируем пользователя
+            del user_block_time[user_id]
+            user_message_count[user_id] = 0
+    return False, 0
+
+def update_user_message_count(user_id):
+    """Обновляет счетчик сообщений пользователя и проверяет лимит"""
+    current_time = datetime.now()
+    
+    # Проверяем блокировку
+    is_blocked, remaining = check_user_block(user_id)
+    if is_blocked:
+        return False, remaining
+    
+    # Увеличиваем счетчик сообщений
+    user_message_count[user_id] += 1
+    
+    # Если это первое сообщение, устанавливаем время начала окна
+    if user_message_count[user_id] == 1:
+        user_block_time[user_id] = current_time + timedelta(seconds=TIME_WINDOW)
+    
+    # Проверяем превышение лимита
+    if user_message_count[user_id] > MESSAGE_LIMIT:
+        block_until = current_time + timedelta(seconds=BLOCK_TIME)
+        user_block_time[user_id] = block_until
+        remaining = BLOCK_TIME
+        return False, remaining
+    
+    return True, 0
+
+def log_to_csv(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        message = args[0]
+        user_id = message.from_user.id
+        username = message.from_user.username or f"{message.from_user.first_name}"
+        
+        # Проверяем блокировку пользователя
+        allowed, remaining = update_user_message_count(user_id)
+        if not allowed:
+            bot.send_message(
+                message.chat.id,
+                f"🚫 Вы заблокированы на {remaining} секунд за слишком частые сообщения. "
+                f"Пожалуйста, подождите {remaining//60} минут {remaining%60} секунд."
+            )
+            return
+        
+        if hasattr(message, 'text'):
+            if message.text.startswith('/'):
+                motion = 'Command'
+                api_name = 'NONE'
+                api_response = 'NONE'
+            else:
+                motion = 'Keyboard typing'
+                api_name = 'NONE'
+                api_response = 'NONE'
+        else:
+            motion = 'Button click'
+            api_name = 'NONE'
+            api_response = 'NONE'
+        
+        current_time = datetime.now()
+        with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                user_id,
+                username,
+                motion,
+                api_name,
+                current_time.strftime('%Y-%m-%d'),
+                current_time.strftime('%H:%M:%S'),
+                api_response
+            ])
+        
+        return func(*args, **kwargs)
+    return wrapper
+
+BOT_TOKEN = TOKEN 
+
+bot = telebot.TeleBot(BOT_TOKEN)
+
+keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+keyboard.row('🌤️ Погода на неделю')
+keyboard.row('💰 Курсы валют НБРБ')
+keyboard.row('📊 Криптовалюты')
+keyboard.row('❓ Помощь')
+
+def get_weather_minsk():
+    """Получение прогноза погоды в Минске на 7 дней через альтернативный API"""
+    try:
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            'latitude': 53.9,
+            'longitude': 27.5667,
+            'daily': 'weathercode,temperature_2m_max,temperature_2m_min',
+            'timezone': 'Europe/Minsk',
+            'forecast_days': 7
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'daily' not in data:
+            return "❌ Ошибка получения данных о погоде", False
+        
+        daily = data['daily']
+        result = "🌤️ Погода в Минске на неделю:\n\n"
+        
+        weather_codes = {
+            0: "☀️ Ясно", 1: "🌤️ Преимущественно ясно", 2: "⛅ Переменная облачность",
+            3: "☁️ Пасмурно", 45: "🌫️ Туман", 48: "🌫️ Инейный туман",
+            51: "🌧️ Легкая морось", 53: "🌧️ Умеренная морось", 55: "🌧️ Сильная морось",
+            61: "🌧️ Небольшой дождь", 63: "🌧️ Умеренный дождь", 65: "🌧️ Сильный дождь",
+            80: "🌧️ Ливень", 81: "🌧️ Сильный ливень", 82: "🌧️ Очень сильный ливень",
+            95: "⛈️ Гроза", 96: "⛈️ Гроза с градом", 99: "⛈️ Сильная гроза с градом"
+        }
+        
+        for i in range(min(7, len(daily['time']))):
+            date = datetime.fromisoformat(daily['time'][i]).strftime('%d.%m.%Y')
+            temp_max = daily['temperature_2m_max'][i]
+            temp_min = daily['temperature_2m_min'][i]
+            weather_code = daily['weathercode'][i]
+            
+            weather_desc = weather_codes.get(weather_code, "❓ Неизвестная погода")
+            
+            result += f"📅 {date}:\n"
+            result += f"   🌡️ {temp_min:.0f}°C - {temp_max:.0f}°C\n"
+            result += f"   {weather_desc}\n\n"
+        
+        return result, True
+        
+    except Exception as e:
+        return f"❌ Ошибка получения данных о погоде: {str(e)}", False
+
+def get_exchange_rates_nbrb():
+    """Получение курсов валют от Национального банка РБ"""
+    try:
+        currencies = {
+            'USD': 'Доллар США',
+            'EUR': 'Евро',
+            'RUB': 'Российский рубль',
+            'CNY': 'Китайский юань',
+            'KZT': 'Казахстанский тенге'
+        }
+        
+        result = "💰 Курсы валют НБРБ:\n\n"
+        
+        for code, name in currencies.items():
+            url = f"https://www.nbrb.by/api/exrates/rates/{code}?parammode=2"
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                rate = data['Cur_OfficialRate']
+                scale = data['Cur_Scale']
+                result += f"🇺🇳 {name} ({code}):\n"
+                result += f"   💰 {scale} {code} = {rate:.4f} BYN\n\n"
+            else:
+                result += f"🇺🇳 {name} ({code}):\n"
+                result += f"   ❌ Данные временно недоступны\n\n"
+        
+        result += "📊 Источник: Национальный банк Республики Беларусь"
+        return result, True
+        
+    except Exception as e:
+        return f"❌ Ошибка получения курсов валют: {str(e)}", False
+
+def get_crypto_prices():
+    """Получение курсов криптовалют в USD"""
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {
+            'ids': 'bitcoin,ethereum,binancecoin,cardano,solana',
+            'vs_currencies': 'usd',
+            'include_24hr_change': 'true'
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        result = "📊 Курсы криптовалют (USD):\n\n"
+        
+        crypto_names = {
+            'bitcoin': '₿ Bitcoin',
+            'ethereum': 'Ξ Ethereum',
+            'binancecoin': 'BNB Binance Coin',
+            'cardano': 'ADA Cardano',
+            'solana': 'SOL Solana'
+        }
+        
+        for crypto_id, info in data.items():
+            if crypto_id in crypto_names:
+                price = info['usd']
+                change = info['usd_24h_change']
+                change_icon = '📈' if change > 0 else '📉'
+                
+                result += f"{crypto_names[crypto_id]}:\n"
+                result += f"   💰 ${price:,.2f}\n"
+                result += f"   {change_icon} {change:+.1f}% (24ч)\n\n"
+        
+        return result, True
+        
+    except Exception as e:
+        return f"❌ Ошибка получения курсов криптовалют: {str(e)}", False
+
+@bot.message_handler(commands=['start'])
+@log_to_csv
+def send_welcome(message):
+    """Обработчик команды /start"""
+    bot.send_message(
+        message.chat.id,
+        f"👋 Привет, {message.from_user.first_name}!\n"
+        "Я бот с полезной информацией! Выберите один из вариантов:",
+        reply_markup=keyboard
+    )
+
+@bot.message_handler(commands=['help'])
+@log_to_csv
+def send_help(message):
+    """Обработчик команды /help"""
+    help_text = """
+🤖 Доступные команды:
+/start - начать работу
+/help - показать справку
+
+📊 Доступные опции:
+🌤️ Погода на неделю - прогноз погоды в Минске
+💰 Курсы валют НБРБ - курсы USD, EUR, RUB, CNY, KZT
+📊 Криптовалюты - курсы основных криптовалют в USD
+❓ Помощь - показать это сообщение
+
+⚡ Ограничения:
+- Максимум 10 сообщений в минуту
+- При превышении лимита - блокировка на 5 минут
+"""
+    bot.send_message(message.chat.id, help_text)
+
+@bot.message_handler(func=lambda message: message.text == "🌤️ Погода на неделю")
+@log_to_csv
+def handle_weather(message):
+    """Обработка кнопки погоды"""
+    weather_info, success = get_weather_minsk()
+    bot.send_message(message.chat.id, weather_info)
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or f"{message.from_user.first_name}"
+    current_time = datetime.now()
+    
+    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            user_id,
+            username,
+            'Button click',
+            'Weather API',
+            current_time.strftime('%Y-%m-%d'),
+            current_time.strftime('%H:%M:%S'),
+            'Success' if success else 'Error'
+        ])
+
+@bot.message_handler(func=lambda message: message.text == "💰 Курсы валют НБРБ")
+@log_to_csv
+def handle_exchange(message):
+    """Обработка кнопки курсов валют"""
+    exchange_info, success = get_exchange_rates_nbrb()
+    bot.send_message(message.chat.id, exchange_info)
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or f"{message.from_user.first_name}"
+    current_time = datetime.now()
+    
+    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            user_id,
+            username,
+            'Button click',
+            'NBRB Exchange API',
+            current_time.strftime('%Y-%m-%d'),
+            current_time.strftime('%H:%M:%S'),
+            'Success' if success else 'Error'
+        ])
+
+@bot.message_handler(func=lambda message: message.text == "📊 Криптовалюты")
+@log_to_csv
+def handle_crypto(message):
+    """Обработка кнопки криптовалют"""
+    crypto_info, success = get_crypto_prices()
+    bot.send_message(message.chat.id, crypto_info)
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or f"{message.from_user.first_name}"
+    current_time = datetime.now()
+    
+    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            user_id,
+            username,
+            'Button click',
+            'Crypto API',
+            current_time.strftime('%Y-%m-%d'),
+            current_time.strftime('%H:%M:%S'),
+            'Success' if success else 'Error'
+        ])
+
+@bot.message_handler(func=lambda message: message.text == "❓ Помощь")
+@log_to_csv
+def handle_help_button(message):
+    """Обработка кнопки помощи"""
+    send_help(message)
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or f"{message.from_user.first_name}"
+    current_time = datetime.now()
+    
+    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            user_id,
+            username,
+            'Button click',
+            'Help Command',
+            current_time.strftime('%Y-%m-%d'),
+            current_time.strftime('%H:%M:%S'),
+            'Success'
+        ])
+
+@bot.message_handler(func=lambda message: True)
+@log_to_csv
+def handle_message(message):
+    """Обработка текстовых сообщений"""
+    text = message.text
+    
+    bot.send_message(
+        message.chat.id,
+        f"Вы написали: «{text}», я не знаю такой команды.\n"
+        "Используйте кнопки ниже или /help для справки.",
+        reply_markup=keyboard
+    )
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or f"{message.from_user.first_name}"
+    current_time = datetime.now()
+    
+    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            user_id,
+            username,
+            'Keyboard typing',
+            'NONE',
+            current_time.strftime('%Y-%m-%d'),
+            current_time.strftime('%H:%M:%S'),
+            'NONE'
+        ])
+
+def run_bot():
+    """Функция для запуска бота"""
+    try:
+        print("Запуск бота...")
+        
+        try:
+            bot_info = bot.get_me()
+            print(f"✅ Бот подключен: @{bot_info.username}")
+        except Exception as e:
+            print(f"❌ Ошибка подключения к Telegram API: {e}")
+            return
+        
+        print("Бот запущен и готов к работе!")
+        print("Для остановки нажмите Ctrl+C")
+        print("-" * 50)
+        print("Логи сохраняются в:", CSV_FILE)
+        print("⚡ Ограничение: 30 сообщений/мин, блокировка на 5 мин при превышении")
+        print("-" * 50)
+        
+        bot.infinity_polling(timeout=30, long_polling_timeout=20)
+        
+    except KeyboardInterrupt:
+        print("\n🛑 Бот остановлен пользователем")
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+
+if __name__ == "__main__":
+    print("Инициализация бота...")
+    
+    if not os.path.exists(CSV_FILE):
+        print("Создан файл для логирования:", CSV_FILE)
+    
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        print("\n🛑 Бот остановлен")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+    finally:
+        print("✅ Работа бота завершена")
